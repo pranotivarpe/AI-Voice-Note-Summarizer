@@ -14,7 +14,15 @@ const aai = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY });
 const app = express();
 const port = process.env.PORT || 5001;
 
-app.use(cors({ origin: ["http://localhost:3000", "http://127.0.0.1:3000"] }));
+// Ensure uploads dir exists (Render's filesystem doesn't persist it across deploys)
+fs.mkdirSync("uploads/", { recursive: true });
+
+const allowedOrigins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
+];
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
 const upload = multer({ dest: "uploads/" });

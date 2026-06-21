@@ -4,7 +4,7 @@ import "./App.css";
 import { useNotes, makeTitle } from "./hooks/useNotes";
 import Waveform from "./components/Waveform";
 
-const API_BASE = "http://localhost:5001";
+const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
 
 const MODE_CONFIG = {
   general:    { label: "General",    icon: "📝", pointsLabel: "Key Points",    itemsLabel: "Action Items",          pointsIcon: "🔑", itemsIcon: "✅" },
