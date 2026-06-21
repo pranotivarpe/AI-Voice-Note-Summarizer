@@ -1,5 +1,4 @@
 // index.js
-// Main backend file: sets up Express server and defines API endpoints.
 require("dotenv").config();
 
 const express = require("express");
@@ -7,131 +6,180 @@ const cors = require("cors");
 const axios = require("axios");
 const multer = require("multer");
 const fs = require("fs");
-
+const crypto = require("crypto");
 
 const { AssemblyAI } = require("assemblyai");
-const aai = new AssemblyAI({
-    apiKey: process.env.ASSEMBLYAI_API_KEY,
-});
+const aai = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY });
 
 const app = express();
 const port = process.env.PORT || 5001;
 
-
-app.use(
-    cors({
-        origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
-    })
-);
-
-
+app.use(cors({ origin: ["http://localhost:3000", "http://127.0.0.1:3000"] }));
 app.use(express.json());
 
-// Configure multer to store uploaded audio files in a temporary folder
 const upload = multer({ dest: "uploads/" });
 
-/**
- * POST /api/transcribe-and-summarize
- * This endpoint receives an audio file, sends it to AssemblyAI to transcribe,
- * then sends the transcript to OpenAI to get a summary and action items.
- */
-app.post(
-    "/api/transcribe-and-summarize",
-    upload.single("audio"),
-    async (req, res) => {
-        try {
-            const audioFilePath = req.file.path;
+// jobId -> { status, transcript, summary, mode, error, createdAt }
+const jobs = new Map();
+const JOB_TTL_MS = 30 * 60 * 1000;
 
-            const audioData = fs.readFileSync(audioFilePath);
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, job] of jobs) {
+        if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+    }
+}, 5 * 60 * 1000);
 
-            const transcript = await aai.transcripts.transcribe({
-                audio: audioData,
-            });
-
-            if (!transcript.text) {
-                throw new Error("Transcription is empty or failed");
-            }
-
-            const transcriptText = transcript.text;
-
-            // 5) Call OpenAI to summarize transcript and extract action items
-
-            const openrouterResponse = await axios.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                {
-                    model: "nex-agi/deepseek-v3.1-nex-n1:free",  // example free model id
-                    messages: [
-                        {
-                            role: "system",
-                            content:
-                                "You are a helpful assistant that summarizes voice notes into key points and action items.",
-                        },
-                        {
-                            role: "user",
-                            content: `
+const MODE_PROMPTS = {
+    general: {
+        system: "You are a helpful assistant that summarizes voice notes into key points and action items.",
+        user: (text) => `
 Here is a voice note transcript:
 
-"${transcriptText}"
+"${text}"
 
-Return ONLY valid JSON (no backticks, no markdown) with this exact shape:
+Return ONLY valid JSON (no backticks, no markdown):
 {
-  "key_points": ["point 1", "point 2", ...],
-  "action_items": ["item 1", "item 2", ...]
-}
-`,
+  "key_points": ["concise key point 1", ...],
+  "action_items": ["clear action item 1", ...]
+}`,
+    },
+    meeting: {
+        system: "You are an expert meeting assistant. Extract the key decisions made and concrete follow-up tasks with owners or deadlines when mentioned.",
+        user: (text) => `
+Here are the notes from a meeting:
 
-                        },
-                    ],
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "http://localhost:3000", // your app/site URL (recommended)
-                        "X-Title": "AI Voice Note Summarizer",   // app name (optional but recommended)
-                    },
-                }
-            );
+"${text}"
 
-            const rawSummary = openrouterResponse.data.choices[0].message.content;
+Return ONLY valid JSON (no backticks, no markdown):
+{
+  "key_points": ["decision or outcome 1 — be specific about what was agreed", ...],
+  "action_items": ["[Owner if mentioned] Action to take by [deadline if mentioned]", ...]
+}`,
+    },
+    brainstorm: {
+        system: "You are a creative thinking assistant. Identify the core concepts and the most promising next steps from a brainstorm session.",
+        user: (text) => `
+Here is a brainstorm voice note:
 
-            // Try to parse the model output as JSON
-            let parsedSummary;
-            try {
-                parsedSummary = JSON.parse(rawSummary);
-            } catch (e) {
-                // If parsing fails, fall back to simple lists
-                parsedSummary = {
-                    key_points: [rawSummary],
-                    action_items: [],
-                };
-            }
+"${text}"
 
-            res.json({
-                transcript: transcriptText,
-                summary: parsedSummary,
-            });
+Return ONLY valid JSON (no backticks, no markdown):
+{
+  "key_points": ["core concept or insight 1", ...],
+  "action_items": ["next step to explore or validate 1", ...]
+}`,
+    },
+    study: {
+        system: "You are a study assistant. Extract the most important facts, definitions, and concepts from a study note, and list what the student should review or practice.",
+        user: (text) => `
+Here is a study session voice note:
 
+"${text}"
 
+Return ONLY valid JSON (no backticks, no markdown):
+{
+  "key_points": ["key fact, concept, or definition 1", ...],
+  "action_items": ["topic or concept to review/practice 1", ...]
+}`,
+    },
+};
 
+async function summarizeTranscript(transcriptText, mode = "general") {
+    const prompt = MODE_PROMPTS[mode] || MODE_PROMPTS.general;
 
-            fs.unlinkSync(audioFilePath);
-        } catch (error) {
-            console.error(
-                "BACKEND ERROR:",
-                error.config?.url,
-                error.response?.status,
-                error.response?.data || error.message
-            );
-
-            return res.status(500).json({
-                error: error.response?.data || error.message || "Something went wrong",
-            });
+    const response = await axios.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+            model: "openai/gpt-oss-120b:free",
+            messages: [
+                { role: "system", content: prompt.system },
+                { role: "user", content: prompt.user(transcriptText) },
+            ],
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:3000",
+                "X-Title": "AI Voice Note Summarizer",
+            },
         }
-    }
-);
+    );
 
-// Start the server
-app.listen(port, () => {
-    console.log(`Backend server is running on http://localhost:${port}`);
+    const raw = response.data.choices[0].message.content;
+
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return { key_points: [raw], action_items: [] };
+    }
+}
+
+async function runJob(jobId, audioFilePath, mode) {
+    const job = jobs.get(jobId);
+
+    try {
+        job.status = "transcribing";
+        const audioData = fs.readFileSync(audioFilePath);
+        const transcript = await aai.transcripts.transcribe({ audio: audioData });
+
+        if (!transcript.text) throw new Error("Transcription is empty or failed");
+
+        job.transcript = transcript.text;
+        job.status = "summarizing";
+        job.summary = await summarizeTranscript(transcript.text, mode);
+        job.status = "done";
+    } catch (error) {
+        console.error("JOB ERROR:", jobId, error.response?.data || error.message);
+        job.status = "error";
+        job.error = error.response?.data || error.message || "Something went wrong";
+    } finally {
+        fs.unlink(audioFilePath, () => {});
+    }
+}
+
+app.post("/api/jobs", upload.single("audio"), (req, res) => {
+    const jobId = crypto.randomUUID();
+    const mode = req.body.mode || "general";
+
+    jobs.set(jobId, {
+        status: "transcribing",
+        transcript: null,
+        summary: null,
+        mode,
+        error: null,
+        createdAt: Date.now(),
+    });
+
+    runJob(jobId, req.file.path, mode);
+    res.json({ jobId });
 });
+
+app.get("/api/jobs/:id", (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    res.json({
+        status: job.status,
+        transcript: job.transcript,
+        summary: job.summary,
+        mode: job.mode,
+        error: job.error,
+    });
+});
+
+app.post("/api/summarize", async (req, res) => {
+    try {
+        const { transcript, mode } = req.body;
+        if (!transcript?.trim()) return res.status(400).json({ error: "transcript is required" });
+
+        const summary = await summarizeTranscript(transcript, mode);
+        res.json({ summary });
+    } catch (error) {
+        console.error("SUMMARIZE ERROR:", error.response?.data || error.message);
+        res.status(500).json({ error: error.response?.data || error.message || "Something went wrong" });
+    }
+});
+
+app.listen(port, () => console.log(`Backend running on http://localhost:${port}`));
